@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-OLX watcher — перевіряє збережені пошуки на olx.ua і повідомляє про нові оголошення.
+OLX watcher (Playwright) — обхід антибота через справжній браузер.
 
-Залежності:  pip install requests
-
-Змінні оточення для сповіщень у Telegram (опційно):
-    TG_TOKEN    — токен бота від @BotFather
-    TG_CHAT_ID  — твій chat_id
+Встановлення:
+    pip install requests playwright
+    python -m playwright install chromium
 
 Запуск:
-    python3 olx_watcher.py            # безкінечний цикл з паузою 10–15 хв
-    python3 olx_watcher.py --once     # одна перевірка (для cron)
+    python olx_watcher_pw.py                 # видимий браузер, цикл 10-15 хв
+    python olx_watcher_pw.py --headless      # без вікна (може ловити капчу)
+    python olx_watcher_pw.py --once          # одна перевірка
+    python olx_watcher_pw.py --notify-first  # слати сповіщення вже на першому запуску
+
+Профіль браузера з cookie зберігається в папці olx_profile поруч зі скриптом,
+тому челендж проходиться один раз, а не щоразу.
 """
 
 import argparse
@@ -25,12 +28,11 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
+from playwright.sync_api import TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------- налаштування
 
-# Додавай сюди скільки завгодно пошуків: "назва": "url"
-# Порада: додай у кінець URL &search%5Border%5D=created_at%3Adesc,
-# щоб найновіші були на першій сторінці.
 SEARCHES = {
     "Оренда 2-3к, 10-20к грн, можна з котом": (
         "https://www.olx.ua/uk/nedvizhimost/kvartiry/dolgosrochnaya-arenda-kvartir/"
@@ -44,43 +46,119 @@ SEARCHES = {
     ),
 }
 
-# Telegram. Значення нижче використовуються, якщо не задані змінні оточення
-# TG_TOKEN / TG_CHAT_ID — вони мають пріоритет.
-TG_TOKEN = ""
-TG_CHAT_ID = ""
+# Telegram. Змінні оточення TG_TOKEN / TG_CHAT_ID мають пріоритет.
+TG_TOKEN = "8966149413:AAEXWgluzbXu9QfTvJ0io2BZqRpPem4Y6Ys"
+TG_CHAT_ID = "443496009"
 
 STATE_FILE = Path(__file__).with_name("olx_seen.json")
-MAX_MESSAGES_PER_RUN = 10  # захист від спаму, якщо стан загубився
+PROFILE_DIR = Path(__file__).with_name("olx_profile")
+MAX_MESSAGES_PER_RUN = 10
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7",
-    "Cache-Control": "no-cache",
-}
+# Слати тільки оголошення з позначкою "Сьогодні" / "Вчора".
+# Постав False, якщо хочеш бачити геть усе нове для тебе.
+ONLY_FRESH = True
+FRESH_MARKERS = ("Сьогодні", "Сегодня", "Вчора", "Вчера")
 
 
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-# ------------------------------------------------------------------ мережа
+# ------------------------------------------------------------------ браузер
 
 
-def fetch(session, url, attempts=3):
-    for i in range(attempts):
+class Browser:
+    """Один довгоживучий браузер на весь час роботи скрипта."""
+
+    def __init__(self, headless=False):
+        self.headless = headless
+        self._pw = None
+        self.ctx = None
+        self.page = None
+
+    def start(self):
+        self._pw = sync_playwright().start()
+        self.ctx = self._pw.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=self.headless,
+            locale="uk-UA",
+            timezone_id="Europe/Kyiv",
+            viewport={"width": 1366, "height": 850},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        # прибираємо найочевиднішу ознаку автоматизації
+        self.page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        log("браузер запущено" + (" (headless)" if self.headless else ""))
+
+    def get(self, url):
         try:
-            r = session.get(url, headers=HEADERS, timeout=30)
-            if r.status_code == 200:
-                return r.text
-            log(f"HTTP {r.status_code} для {url}")
-        except requests.RequestException as e:
-            log(f"помилка запиту: {e}")
-        time.sleep(5 * (i + 1))
-    return None
+            self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        except PWTimeout:
+            log("сторінка не завантажилась за 60 с")
+            return None
+        landed = self.page.url
+        if landed.split("#")[0] != url.split("#")[0]:
+            log(f"  увага: запит {url}")
+            log(f"  відкрилось  {landed}")
+        try:
+            self.page.wait_for_selector('[data-cy="l-card"]', timeout=20_000)
+        except PWTimeout:
+            # може бути капча або порожня видача — віддамо що є, розбереться парсер
+            pass
+        # трохи «людської» поведінки
+        try:
+            self.page.mouse.wheel(0, random.randint(400, 1200))
+            self.page.wait_for_timeout(random.randint(700, 1800))
+        except Exception:
+            pass
+        return self.page.content()
+
+    def extract_ads(self):
+        """Читаємо картки прямо з DOM — не залежимо від внутрішнього JSON OLX."""
+        js = """
+        () => Array.from(document.querySelectorAll('[data-cy="l-card"]')).map(el => {
+            const a = el.querySelector('a[href]');
+            const href = a ? a.href : '';
+            const m = href.match(/-ID([0-9A-Za-z]+)\\.html/);
+            const pick = sel => {
+                const n = el.querySelector(sel);
+                return n ? n.innerText.trim().replace(/\\s+/g, ' ') : '';
+            };
+            return {
+                id: String(el.getAttribute('id') || (m ? m[1] : href)),
+                title: pick('h4') || pick('h6') || pick('[data-cy="ad-card-title"]'),
+                url: href.split('?')[0],
+                price: pick('[data-testid="ad-price"]'),
+                place: pick('[data-testid="location-date"]'),
+            };
+        }).filter(x => x.url && x.id)
+        """
+        try:
+            return self.page.evaluate(js)
+        except Exception as e:
+            log(f"не вдалося прочитати DOM: {e}")
+            return []
+
+    def dump(self, name="olx_debug.html"):
+        try:
+            Path(__file__).with_name(name).write_text(
+                self.page.content(), encoding="utf-8"
+            )
+            log(f"розмітку збережено у {name}")
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            if self.ctx:
+                self.ctx.close()
+            if self._pw:
+                self._pw.stop()
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------- розбір сторінки OLX
@@ -140,7 +218,6 @@ def dig(node, *keys):
 
 
 def walk_for_ads(node, out):
-    """Запасний варіант: рекурсивно шукаємо об'єкти, схожі на оголошення."""
     if isinstance(node, dict):
         if isinstance(node.get("title"), str) and node.get("id") and node.get("url"):
             out[str(node["id"])] = node
@@ -196,7 +273,6 @@ def normalize(ad):
         "url": url,
         "price": price_of(ad),
         "place": place,
-        "created": ad.get("created_time") or ad.get("last_refresh_time") or "",
     }
 
 
@@ -210,7 +286,6 @@ def parse_page(page):
         ads = [a for a in ads if a["id"] and a["url"]]
         if ads:
             return ads
-    # якщо OLX змінив розмітку — хоча б посилання витягнемо
     seen, ads = set(), []
     for path, ad_id in FALLBACK_RE.findall(page):
         if ad_id in seen:
@@ -223,7 +298,6 @@ def parse_page(page):
                 "url": "https://www.olx.ua" + path,
                 "price": "",
                 "place": "",
-                "created": "",
             }
         )
     return ads
@@ -266,8 +340,7 @@ def notify(search_name, ad):
         parts.append(esc(ad["place"]))
     parts.append(ad["url"])
     parts.append(f"<i>{esc(search_name)}</i>")
-    text = "\n".join(parts)
-    if not send_telegram(text):
+    if not send_telegram("\n".join(parts)):
         log("НОВЕ: " + " | ".join([ad["title"], str(ad["price"]), ad["place"], ad["url"]]))
 
 
@@ -292,20 +365,55 @@ def save_state(state):
 # ------------------------------------------------------------------ логіка
 
 
-def check_all(session, state, notify_first=False):
-    for name, url in SEARCHES.items():
-        page = fetch(session, url)
-        if page is None:
-            log(f"{name}: сторінку не отримав, пропускаю цей цикл")
-            continue
+def page_url(url, n):
+    if n <= 1:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}page={n}"
 
-        ads = parse_page(page)
+
+def check_all(browser, state, notify_first=False, pages=1):
+    for name, url in SEARCHES.items():
+        ads, seen_ids = [], set()
+        for n in range(1, pages + 1):
+            page = browser.get(page_url(url, n))
+            if page is None:
+                log(f"{name}: сторінку {n} не отримав")
+                continue
+            batch = browser.extract_ads() or parse_page(page)
+            if not batch:
+                if n == 1:
+                    log(f"{name}: жодного оголошення не розпарсив — капча або зміна верстки.")
+                    browser.dump()
+                    if not browser.headless:
+                        log("Перевір вікно браузера: якщо там перевірка — пройди її вручну.")
+                break  # далі сторінок немає
+            new_here = [a for a in batch if a["id"] not in seen_ids]
+            log(f"  стор. {n}: карток {len(batch)}, унікальних {len(new_here)}")
+            if not new_here:
+                break  # OLX повернув ту саму сторінку — далі йти нема сенсу
+            for a in new_here:
+                seen_ids.add(a["id"])
+                ads.append(a)
+            if n < pages:
+                time.sleep(random.uniform(2, 5))
+
         if not ads:
-            log(f"{name}: жодного оголошення не розпарсив (можливо, капча або зміна верстки)")
             continue
+        if pages > 1:
+            log(f"{name}: зібрано {len(ads)} оголошень з {pages} стор.")
 
         known = set(state.get(name, []))
         fresh = [a for a in ads if a["id"] not in known]
+
+        if ONLY_FRESH:
+            skipped = len(fresh)
+            fresh = [
+                a for a in fresh if any(m in (a.get("place") or "") for m in FRESH_MARKERS)
+            ]
+            skipped -= len(fresh)
+            if skipped:
+                log(f"{name}: {skipped} старих за датою пропущено")
 
         if name not in state and not notify_first:
             state[name] = [a["id"] for a in ads]
@@ -318,9 +426,8 @@ def check_all(session, state, notify_first=False):
         if len(fresh) > MAX_MESSAGES_PER_RUN:
             log(f"{name}: ще {len(fresh) - MAX_MESSAGES_PER_RUN} нових не показав")
 
-        # зберігаємо останні 500 ID, щоб файл не ріс безкінечно
         merged = [a["id"] for a in ads] + state.get(name, [])
-        state[name] = list(dict.fromkeys(merged))[:500]
+        state[name] = list(dict.fromkeys(merged))[:3000]
         save_state(state)
         log(f"{name}: на сторінці {len(ads)}, нових {len(fresh)}")
 
@@ -328,29 +435,31 @@ def check_all(session, state, notify_first=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true", help="одна перевірка і вихід")
+    ap.add_argument("--headless", action="store_true", help="без вікна браузера")
     ap.add_argument("--min", type=float, default=10, help="мін. пауза, хв")
     ap.add_argument("--max", type=float, default=15, help="макс. пауза, хв")
-    ap.add_argument(
-        "--notify-first",
-        action="store_true",
-        help="слати сповіщення вже на першому запуску",
-    )
+    ap.add_argument("--notify-first", action="store_true")
+    ap.add_argument("--pages", type=int, default=1, help="скільки сторінок видачі обходити")
     args = ap.parse_args()
 
-    session = requests.Session()
     state = load_state()
+    browser = Browser(headless=args.headless)
+    browser.start()
 
-    while True:
-        try:
-            check_all(session, state, notify_first=args.notify_first)
-        except Exception as e:  # цикл не має падати через одну помилку
-            log(f"несподівана помилка: {type(e).__name__}: {e}")
+    try:
+        while True:
+            try:
+                check_all(browser, state, notify_first=args.notify_first, pages=args.pages)
+            except Exception as e:
+                log(f"несподівана помилка: {type(e).__name__}: {e}")
 
-        if args.once:
-            return
-        pause = random.uniform(args.min * 60, args.max * 60)
-        log(f"сплю {pause / 60:.1f} хв")
-        time.sleep(pause)
+            if args.once:
+                return
+            pause = random.uniform(args.min * 60, args.max * 60)
+            log(f"сплю {pause / 60:.1f} хв")
+            time.sleep(pause)
+    finally:
+        browser.close()
 
 
 if __name__ == "__main__":
